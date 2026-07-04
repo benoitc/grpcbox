@@ -474,21 +474,23 @@ unary_no_auth(_Config) ->
 unary_authenticated(Config) ->
     unary(Config).
 
-%% checks that no closed streams are left around after unary requests
+%% checks that stream accounting on the connection stays consistent after
+%% unary requests. h2 keeps a bounded cache of recently closed streams, so
+%% completed streams can not accumulate by construction
 unary_garbage_collect_streams(Config) ->
     unary(Config),
 
-    ConnectionStreamSet = connection_stream_set(),
+    Conn = client_connection(),
 
-    ?assertEqual([], chatterbox_h2_stream_set:my_active_streams(ConnectionStreamSet)).
+    ?assertEqual(ok, h2_connection:verify_stream_counts(Conn)).
 
 client_stream_garbage_collect_streams(Config) ->
     client_stream(Config),
 
     timer:sleep(100),
-    ConnectionStreamSet = connection_stream_set(),
+    Conn = client_connection(),
 
-    ?assertEqual([], chatterbox_h2_stream_set:my_active_streams(ConnectionStreamSet)).
+    ?assertEqual(ok, h2_connection:verify_stream_counts(Conn)).
 
 multiple_servers(_Config) ->
     application:set_env(grpcbox, client, #{channels => [{default_channel, [{http, "localhost", 8080, []},
@@ -603,14 +605,13 @@ stream_interceptor(_Config) ->
 
 %%
 
-%% verify that the chatterbox stream isn't storing frame data
+%% verify that the client stream process isn't holding on to frame data
 check_stream_state(S) ->
-    {_, StreamState} = sys:get_state(maps:get(stream_pid, S)),
-    FrameQueue = element(7, StreamState),
-    ?assert(queue:is_empty(FrameQueue)).
+    StreamState = sys:get_state(maps:get(stream_pid, S)),
+    ?assertEqual(<<>>, maps:get(buffer, StreamState)).
 
-%% return the stream_set of a connection in the channel
-connection_stream_set() ->
+%% return the connection of a subchannel in the channel
+client_connection() ->
     {ok, {Channel, _}} = grpcbox_channel:pick(default_channel, unary),
     {ok, Conn, _} = grpcbox_subchannel:conn(Channel),
     Conn.
