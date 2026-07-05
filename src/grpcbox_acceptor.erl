@@ -45,25 +45,52 @@ become_connection(Transport, Socket, ServerSettings, StreamOpts) ->
     process_flag(trap_exit, true),
     {ok, Conn} = h2_connection:start_link(server, Socket, self(),
                                           #{settings => ServerSettings}),
-    ok = controlling_process(Transport, Socket, Conn),
-    ok = h2_connection:activate(Conn),
-    connection_loop(Conn, StreamOpts, #{}).
+    case controlling_process(Transport, Socket, Conn) of
+        ok ->
+            case h2_connection:activate(Conn) of
+                ok ->
+                    connection_loop(Conn, parent(), StreamOpts, #{});
+                {error, _} ->
+                    %% the peer disconnected right after the accept
+                    close_connection(Transport, Socket, Conn),
+                    exit(normal)
+            end;
+        {error, _} ->
+            close_connection(Transport, Socket, Conn),
+            exit(normal)
+    end.
 
 controlling_process(ssl, Socket, Pid) ->
     ssl:controlling_process(Socket, Pid);
 controlling_process(gen_tcp, Socket, Pid) ->
     gen_tcp:controlling_process(Socket, Pid).
 
-connection_loop(Conn, StreamOpts, Streams) ->
+close_connection(Transport, Socket, Conn) ->
+    try h2_connection:close(Conn) catch _:_ -> ok end,
+    case Transport of
+        ssl -> ssl:close(Socket);
+        gen_tcp -> gen_tcp:close(Socket)
+    end.
+
+%% the acceptor process is spawned by the acceptor_pool with proc_lib
+parent() ->
+    case get('$ancestors') of
+        [Parent | _] when is_pid(Parent) ->
+            Parent;
+        _ ->
+            undefined
+    end.
+
+connection_loop(Conn, Parent, StreamOpts, Streams) ->
     receive
         {h2, Conn, {request, StreamId, Method, Path, Headers}} ->
             ReqHeaders = [{<<":method">>, Method}, {<<":path">>, Path} | Headers],
             case grpcbox_stream:start_link(Conn, StreamId, ReqHeaders, StreamOpts) of
                 {ok, Pid} ->
-                    connection_loop(Conn, StreamOpts, Streams#{Pid => StreamId});
+                    connection_loop(Conn, Parent, StreamOpts, Streams#{Pid => StreamId});
                 _ ->
                     _ = h2:cancel(Conn, StreamId, internal_error),
-                    connection_loop(Conn, StreamOpts, Streams)
+                    connection_loop(Conn, Parent, StreamOpts, Streams)
             end;
         {'EXIT', Conn, Reason} ->
             exit(Reason);
@@ -80,11 +107,15 @@ connection_loop(Conn, StreamOpts, Streams) ->
                     %% trailers that will never come
                     _ = h2:cancel(Conn, StreamId, internal_error)
             end,
-            connection_loop(Conn, StreamOpts, Streams1);
+            connection_loop(Conn, Parent, StreamOpts, Streams1);
+        {'EXIT', Parent, Reason} ->
+            %% acceptor pool is going away, take the connection down with us
+            try h2_connection:close(Conn) catch _:_ -> ok end,
+            exit(Reason);
         {'EXIT', _Pid, shutdown} ->
             %% acceptor pool is shutting down
             try h2_connection:close(Conn) catch _:_ -> ok end,
             exit(shutdown);
         _ ->
-            connection_loop(Conn, StreamOpts, Streams)
+            connection_loop(Conn, Parent, StreamOpts, Streams)
     end.

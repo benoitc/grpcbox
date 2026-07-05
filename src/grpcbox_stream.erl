@@ -53,6 +53,7 @@
                 resp_trailers=[]    :: list(),
                 headers_sent=false  :: boolean(),
                 trailers_sent=false :: boolean(),
+                client_done=false   :: boolean(),
                 unary_interceptor   :: fun() | undefined,
                 stream_interceptor  :: fun() | undefined,
                 stream_id           :: h2:stream_id(),
@@ -302,15 +303,24 @@ handle_unary(Ctx, Message, State=#state{unary_interceptor=UnaryInterceptor,
             throw(E)
     end.
 
-end_of_stream(State=#state{input_ref=Ref,
-                           callback_pid=Pid,
-                           method=#method{input={_Input, true}}}) ->
+end_of_stream(State0) ->
+    end_of_stream_(State0#state{client_done=true}).
+
+end_of_stream_(State=#state{input_ref=Ref,
+                            callback_pid=Pid,
+                            method=#method{input={_Input, true}}}) ->
     Pid ! {Ref, eos},
     State;
-end_of_stream(State=#state{method=#method{input={_Input, false},
-                                          output={_Output, true}}}) ->
+end_of_stream_(State=#state{callback_pid=undefined,
+                            method=#method{input={_Input, false},
+                                           output={_Output, true}}}) ->
+    %% half-closed before a request message arrived, no handler was started
+    %% so no one will ever end this stream
+    end_stream(?GRPC_STATUS_INTERNAL, <<"half-closed without a request message">>, State);
+end_of_stream_(State=#state{method=#method{input={_Input, false},
+                                           output={_Output, true}}}) ->
     State;
-end_of_stream(State) ->
+end_of_stream_(State) ->
     end_stream(State).
 
 %% gen_server callbacks
@@ -355,10 +365,23 @@ handle_info({timeout, _Ref, <<"grpc-timeout">>}, State) ->
 handle_info(_, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{callback_pid=Pid}) when is_pid(Pid) ->
+terminate(_Reason, State=#state{callback_pid=Pid}) when is_pid(Pid) ->
     exit(Pid, {shutdown, stream_terminated}),
+    maybe_reset(State),
     ok;
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    maybe_reset(State),
+    ok.
+
+%% the response is complete but the client's send side is still open: reset
+%% the stream so it doesn't keep streaming into the void and the stream
+%% doesn't stay half open on the connection
+maybe_reset(#state{trailers_sent=true,
+                   client_done=false,
+                   connection=Conn,
+                   stream_id=StreamId}) ->
+    try h2:cancel(Conn, StreamId, no_error) catch _:_ -> ok end;
+maybe_reset(_) ->
     ok.
 
 handle_event({data, _StreamId, Bin, IsFin}, State) ->
@@ -490,9 +513,24 @@ send(End, Message, State=#state{ctx=Ctx,
                                                output={Output, _}}}) ->
     BodyToSend = Proto:encode_msg(Message, Output),
     OutFrame = grpcbox_frame:encode(Encoding, BodyToSend),
-    _ = h2:send_data(Conn, StreamId, OutFrame, End, #{block => infinity}),
+    %% block on flow control, bounded by the request deadline so the
+    %% grpc-timeout still fires against a stalled client
+    case h2:send_data(Conn, StreamId, OutFrame, End, #{block => block_timeout(Ctx)}) of
+        {error, timeout} ->
+            exit({shutdown, send_timeout});
+        _ ->
+            ok
+    end,
     stats_handler(Ctx, out_payload, #{uncompressed_size => erlang:external_size(Message),
                                       compressed_size => size(BodyToSend)}, State).
+
+block_timeout(Ctx) ->
+    case ctx:deadline(Ctx) of
+        D when D =:= undefined ; D =:= infinity ->
+            infinity;
+        {T, _} ->
+            max(0, erlang:convert_time_unit(T - erlang:monotonic_time(), native, millisecond))
+    end.
 
 response_encoding(gzip) ->
     [{<<"grpc-encoding">>, <<"gzip">>}];

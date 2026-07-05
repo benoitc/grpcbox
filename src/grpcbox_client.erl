@@ -152,10 +152,15 @@ close_and_recv(Stream) ->
 
 close_send(#{channel := Conn,
              stream_id := StreamId}) ->
-    %% half-close the send side. A no-op if the stream is already gone, the
-    %% error is delivered to the caller through the stream events
-    _ = h2:send_data(Conn, StreamId, <<>>, true),
-    ok.
+    %% half-close the send side. A no-op if the stream or the connection is
+    %% already gone, the error is delivered through the stream events
+    try h2:send_data(Conn, StreamId, <<>>, true) of
+        _ ->
+            ok
+    catch
+        exit:_ ->
+            ok
+    end.
 
 send(Stream=#{stream_interceptor := #{send_msg := SendMsg}}, Input) ->
     SendMsg(Stream, fun grpcbox_client_stream:send_msg/2, Input);

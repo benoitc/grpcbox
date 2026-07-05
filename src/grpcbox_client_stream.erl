@@ -68,9 +68,15 @@ send_request(Ctx, Channel, Path, Input, #grpcbox_def{service=Service,
                     case h2:send_data(Conn, StreamId, Body, true, #{block => infinity}) of
                         ok ->
                             {ok, Conn, StreamId, Pid};
+                        {error, Reason} when Reason =:= stream_closed ;
+                                             Reason =:= stream_reset ->
+                            %% the server already finished the rpc, e.g. a
+                            %% Trailers-Only error response, its status is
+                            %% delivered through the stream events
+                            {ok, Conn, StreamId, Pid};
                         {error, _}=Err ->
                             _ = h2:cancel(Conn, StreamId, cancel),
-                            gen_server:stop(Pid),
+                            catch gen_server:stop(Pid),
                             Err
                     end
             end;
@@ -114,10 +120,15 @@ send_msg(#{channel := Conn,
            service_def := #grpcbox_def{marshal_fun=MarshalFun}}, Input) ->
     OutFrame = grpcbox_frame:encode(Encoding, MarshalFun(Input)),
     %% block on flow control instead of failing on a full send buffer. A
-    %% send on a stream that is already gone is a no-op, the stream events
-    %% deliver the error to the caller
-    _ = h2:send_data(Conn, StreamId, OutFrame, false, #{block => infinity}),
-    ok.
+    %% send on a stream or connection that is already gone is a no-op, the
+    %% error is delivered to the caller through the stream events
+    try h2:send_data(Conn, StreamId, OutFrame, false, #{block => infinity}) of
+        _ ->
+            ok
+    catch
+        exit:_ ->
+            ok
+    end.
 
 recv_msg(S=#{stream_id := Id,
              stream_pid := Pid,
@@ -231,14 +242,28 @@ handle_event({trailers, StreamId, Trailers}, State=#{ctx := Ctx,
     end_of_stream(StreamId, State#{ctx => Ctx1});
 handle_event({stream_reset, _StreamId, ErrorCode}, State) ->
     {stop, {shutdown, {stream_reset, ErrorCode}}, State};
+handle_event({goaway, LastStreamId, _ErrorCode}, State=#{client_pid := Pid}) ->
+    case maps:get(stream_id, State, undefined) of
+        StreamId when is_integer(StreamId), StreamId > LastStreamId ->
+            %% the server will never process this stream, it is safe to retry
+            Pid ! {trailers, StreamId, {<<"14">>, <<"connection draining">>, #{}}},
+            end_of_stream(StreamId, State);
+        _ ->
+            {noreply, State}
+    end;
 handle_event({closed, Reason}, State) ->
     {stop, {shutdown, {connection_closed, Reason}}, State};
 handle_event(_, State) ->
     {noreply, State}.
 
-end_of_stream(StreamId, State=#{ctx := Ctx,
+end_of_stream(StreamId, State=#{conn := Conn,
+                                ctx := Ctx,
                                 client_pid := Pid}) ->
     Pid ! {eos, StreamId},
+    %% if our send side is still open, reset the stream so it doesn't stay
+    %% half open on the connection, counting against concurrent streams. A
+    %% no-op when the stream is already fully closed
+    try h2:cancel(Conn, StreamId, cancel) catch _:_ -> ok end,
     State1 = stats_handler(Ctx, rpc_end, {}, State),
     {stop, normal, State1}.
 
